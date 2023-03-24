@@ -98,8 +98,8 @@ class Patch(nn.Module):
     def forward(self, x):
         x = self.__patch_embedding(x);
         x = x.flatten(2).permute(0,2,1);
-        embedding = torch.cat([self.__cls_embedding.expand(config.BATCH_SIZE*2, -1,-1), x], dim=1);
-        embedding = embedding + self.__pos_embedding.expand(config.BATCH_SIZE*2, -1, -1);
+        embedding = torch.cat([self.__cls_embedding.expand(x.shape[0], -1,-1), x], dim=1);
+        embedding = embedding + self.__pos_embedding.expand(x.shape[0], -1, -1);
         embedding = self.__dropout(embedding);
         return embedding;
 
@@ -214,7 +214,8 @@ class ViT(nn.Module):
         heads,
         dropout,
         forward_expansion,
-        num_classes
+        classification = False,
+        num_classes = None
         ) -> None:
         super().__init__();
         num_patches = (img_size//patch_size)**2;
@@ -223,29 +224,25 @@ class ViT(nn.Module):
         self.input_layer = nn.Linear(in_channels*(patch_size**2), embedding_size)
         self.__patch_embedding = Patch(in_channels, img_size, patch_size, embedding_size, dropout);
         self.__transformer_encoder = Encoder(embedding_size, heads, forward_expansion, dropout);
-        self.__classifier = nn.Sequential(
-            nn.LayerNorm(embedding_size),
-            nn.Linear(embedding_size, num_classes)
-        )
-
-        self.cls_token = nn.Parameter(torch.randn(1,1,embedding_size))
-        self.pos_embedding = nn.Parameter(torch.randn(1,1+num_patches,embedding_size))
+        if classification is True:
+            self._classifier = nn.Sequential(
+                nn.LayerNorm(embedding_size),
+                nn.Linear(embedding_size, num_classes)
+            )
 
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         x = self.__patch_embedding(x);
-        B, T, _ = x.shape
-        #x = self.input_layer(x)
-
-        # Add CLS token and positional encoding
-        # cls_token = self.cls_token.repeat(B, 1, 1)
-        # x = torch.cat([cls_token, x], dim=1)
-        # x = x + self.pos_embedding[:,:T+1];
-
+        
         x = self.dropout(x)
 
         enc = self.__transformer_encoder(x);
+
+        if hasattr(self, "_classifier"):
+            enc_mean = torch.mean(enc,dim = 1);
+            out = self._classifier(enc_mean);
+            return enc, out;
         return enc;
 
 

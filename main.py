@@ -9,7 +9,7 @@ from turtle import forward
 ## Imports for plotting
 import matplotlib.pyplot as plt
 
-from utils import tensor_img_to_numpy
+from utils import loss_fn, tensor_img_to_numpy
 plt.set_cmap('cividis')
 from IPython.display import set_matplotlib_formats
 set_matplotlib_formats('svg', 'pdf') # For export
@@ -86,47 +86,57 @@ class CLSHead(nn.Module):
     def forward(self, x):
         return self.mlp(x);
 
-class SelfSupervisedModel(nn.Module):
-    def __init__(self) -> None:
+class MLP(nn.Module):
+    def __init__(self, inp_size, out_size, hidden_size) -> None:
         super().__init__();
-        #self.model = ViTM(3,96,12, classification=False, spatial_dims=2);
-        #ViTM()
-        self.model = ViTS(3, 96,12,768,12,0.0,4,10 );
+        self.net = nn.Sequential(
+            nn.Linear(inp_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, out_size),
+            nn.BatchNorm1d(out_size),
+        )
+    def forward(self, x):
+        return self.net(x);
 
-        self.contrastive_head = CLSHead(768,256);
+class SelfSupervisedModel(nn.Module):
+    def __init__(self, projection, predicition=None) -> None:
+        super().__init__();
+        self.encoder = ViTS(3, 96,12,768,12,0.0,4,10 );
 
-        self.rec_head = RECHead(in_dim=768);
-
-        self.model = self.model.to(DEVICE);
-        self.contrastive_head = self.contrastive_head.to(DEVICE);
-        self.rec_head = self.rec_head.to(DEVICE);
+        self.projection = projection;
+        self.prediction = predicition;
+        self.rec_head = RECHead(768);
 
     def forward(self, x):
-        model_output = self.model(x);
+        model_output = self.encoder(x);
 
-        #rconstruction head
-        rh = self.rec_head(model_output[:,1:]);
-        #contrastive heard
-        ch = self.contrastive_head(model_output[:,0]);
+        projection = self.projection(model_output[:,0]);
+        if self.prediction is not None:
+            predicition = self.prediction(projection);
+            #rconstruction head
+            rh = self.rec_head(model_output[:,1:]);
+            return rh, predicition;
+        else:
+            return projection;
 
-        return ch, rh;
+def update_ema(ma_model, current_model, beta=0.99):
+    for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+        old_weight, up_weight = ma_params.data, current_params.data;
+        ma_params.data = old_weight * beta + (1-beta) * up_weight;
 
-
-
-
-
-def train(e, model, optimizer, loader,):
-    print(('\n' + '%10s'*4) %('Epoch', 'Loss', 'Rec_Loss', 'Acc'));
+def train(e, online, target, optimizer, loader,):
+    print(('\n' + '%10s'*3) %('Epoch', 'Loss', 'Rec_Loss'));
     pbar = enumerate(loader);
     pbar = tqdm(pbar, total=len(loader), bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}');
     epochs_loss = [];
-    epoch_acc = [];
+
     epoch_rec_loss = [];
-    plot = True;
+    
     for idx, (batch) in pbar:
         imgs, _ = batch
-        imgs_crops = torch.cat(imgs[0], dim=0)
-        imgs_corrupted = torch.cat(imgs[1], dim=0)
+        imgs_crops = torch.cat(imgs[0], dim = 0)
+        imgs_corrupted = torch.cat(imgs[1], dim = 0);
         imgs_masks = torch.cat(imgs[2], dim=0)
         imgs_crops, imgs_corrupted, imgs_masks = imgs_crops.to(DEVICE), imgs_corrupted.to(DEVICE), imgs_masks.to(DEVICE);
 
@@ -143,54 +153,29 @@ def train(e, model, optimizer, loader,):
                 plt.clf();
             
 
-        # # Encode all images
-        ch,rh = model(imgs_corrupted.float())
+        #run images through online and target networks
+        rh, prediction = online(imgs_corrupted.float())
+        with torch.no_grad():
+            proj = target(imgs_corrupted.float());
+            proj.detach_();
+
+        #get loss
+        loss, rec_loss = loss_fn(prediction, proj.detach(), rh, imgs_crops, imgs_masks);
 
         
-        # Calculate cosine similarity
-        cos_sim = F.cosine_similarity(ch[:,None,:], ch[None,:,:], dim=-1)
-        # # Mask out cosine similarity to itself
-        self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, device=DEVICE)
-        cos_sim.masked_fill_(self_mask, -9e15)
-        # # Find positive example -> batch_size//2 away from the original example
-        pos_mask = self_mask.roll(shifts=cos_sim.shape[0]//2, dims=0)
-        # # InfoNCE loss
-        cos_sim = cos_sim / TEMPERATURE
-        simclr_loss = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
-        simclr_loss = simclr_loss.mean()
-
-        #calculate rec loss
-        rec_loss = F.l1_loss(rh, imgs_crops, reduction='none');
-        rec_loss = rec_loss[imgs_masks == 1].mean();
-
-        loss = simclr_loss + rec_loss;
-
         loss.backward();
         optimizer.step();
-        model.zero_grad(set_to_none=True);
-
         loss = loss.item();
-
-        # Get ranking position of positive example
-        comb_sim = torch.cat([cos_sim[pos_mask][:,None],  # First position positive example
-                              cos_sim.masked_fill(pos_mask, -9e15)],
-                             dim=-1)
-        sim_argsort = comb_sim.argsort(dim=-1, descending=True).argmin(dim=-1)
-        acc = (sim_argsort == 0).float().mean().item();
+        online.zero_grad(set_to_none = True);
 
         epochs_loss.append(loss);
-        epoch_acc.append(acc);
         epoch_rec_loss.append(rec_loss.item());
 
-        if plot is True:
-            plot = False;
-            bz = 8;
+        #update EMA
+        update_ema(target.encoder, online.encoder);
+        update_ema(target.projection, online.projection);
 
-            imagesToPrint = torch.cat([imgs_crops[0: min(15, bz)].cpu(),  imgs_corrupted[0: min(15, bz)].cpu(),
-                                       rh[0: min(15, bz)].cpu(), imgs_masks[0: min(15, bz)].cpu()], dim=0)
-            torchvision.utils.save_image(imagesToPrint, f'samples\\{e}.png', nrow=min(15, bz), normalize=True, range=(-1, 1))
-
-        pbar.set_description(("%10s" + "%10.4g"*3) %(e, np.mean(epochs_loss), np.mean(epoch_rec_loss), np.mean(epoch_acc)))
+        pbar.set_description(("%10s" + "%10.4g"*2) %(e, np.mean(epochs_loss), np.mean(epoch_rec_loss)))
         pass
 
     return np.mean(epochs_loss);
@@ -227,47 +212,43 @@ def save_samples(e, model, loader):
             cv2.imwrite(f'samples\\{e}\\{i}_orig.png', orig);
             cv2.imwrite(f'samples\\{e}\\{i}_rec.png', rec);
 
-def valid(e, model, loader,):
-    print(('\n' + '%10s'*3) %('Valid: Epoch', 'Loss', 'Acc'));
+def valid(e, online, target, loader,):
+    print(('\n' + '%10s'*3) %('Valid: Epoch', 'Loss', 'Rec_loss'));
     pbar = enumerate(loader);
     pbar = tqdm(pbar, total=len(loader), bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}');
     epochs_loss = [];
-    epoch_acc = [];
+    epoch_rec_loss = [];
+    plot = True;
     with torch.no_grad():
         for idx, (batch) in pbar:
             imgs, _ = batch
-            imgs = torch.cat(imgs, dim=0)
-            imgs = imgs.to(DEVICE);
+            imgs_crops = torch.cat(imgs[0], dim = 0)
+            imgs_corrupted = torch.cat(imgs[1], dim = 0);
+            imgs_masks = torch.cat(imgs[2], dim=0)
+            imgs_crops, imgs_corrupted, imgs_masks = imgs_crops.to(DEVICE), imgs_corrupted.to(DEVICE), imgs_masks.to(DEVICE);
 
-            # Encode all images
-            feats = model(imgs.float())
-            # Calculate cosine similarity
-            cos_sim = F.cosine_similarity(feats[:,None,:], feats[None,:,:], dim=-1)
-            # Mask out cosine similarity to itself
-            self_mask = torch.eye(cos_sim.shape[0], dtype=torch.bool, DEVICE=cos_sim.DEVICE)
-            cos_sim.masked_fill_(self_mask, -9e15)
-            # Find positive example -> batch_size//2 away from the original example
-            pos_mask = self_mask.roll(shifts=cos_sim.shape[0]//2, dims=0)
-            # InfoNCE loss
-            cos_sim = cos_sim / TEMPERATURE
-            nll = -cos_sim[pos_mask] + torch.logsumexp(cos_sim, dim=-1)
-            nll = nll.mean()
+            rh, prediction = online(imgs_corrupted.float())
 
-            loss = nll.item();
+            proj = target(imgs_corrupted.float());
+            proj.detach_();
 
-            # Get ranking position of positive example
-            comb_sim = torch.cat([cos_sim[pos_mask][:,None],  # First position positive example
-                                cos_sim.masked_fill(pos_mask, -9e15)],
-                                dim=-1)
-            sim_argsort = comb_sim.argsort(dim=-1, descending=True).argmin(dim=-1)
-            acc = (sim_argsort == 0).float().mean().item();
+            #get loss
+            loss, rec_loss = loss_fn(prediction, proj.detach(), rh, imgs_crops, imgs_masks);
 
-            epochs_loss.append(loss);
-            epoch_acc.append(acc);
+            epochs_loss.append(loss.item());
+            epoch_rec_loss.append(rec_loss.item());
 
-            pbar.set_description(("%10s" + "%10.4g"*2) %(e, np.mean(epochs_loss), np.mean(epoch_acc)))
+            if plot is True:
+                plot = False;
+                bz = 8;
 
-    return np.mean(epochs_loss), np.mean(epoch_acc);
+                imagesToPrint = torch.cat([imgs_crops[0: min(15, bz)].cpu(),  imgs_corrupted[0: min(15, bz)].cpu(),
+                                        rh[0: min(15, bz)].cpu(), imgs_masks[0: min(15, bz)].cpu()], dim=0)
+                torchvision.utils.save_image(imagesToPrint, f'samples\\{e}.png', nrow=min(15, bz), normalize=True, range=(-1, 1))
+
+            pbar.set_description(("%10s" + "%10.4g"*2) %(e, np.mean(epochs_loss), np.mean(epoch_rec_loss)))
+
+    return np.mean(epochs_loss), np.mean(epoch_rec_loss);
 
 @torch.no_grad()
 def prepare_data_features(model, dataset):
@@ -282,7 +263,8 @@ def prepare_data_features(model, dataset):
     feats, labels = [], []
     for batch_imgs, batch_labels in tqdm(data_loader):
         batch_imgs = batch_imgs.to(DEVICE)
-        batch_feats = network(batch_imgs)
+        batch_feats,_ = network(batch_imgs)
+        batch_feats = torch.mean(batch_feats, dim = 1);
         feats.append(batch_feats.detach().cpu())
         labels.append(batch_labels)
 
@@ -334,15 +316,21 @@ if __name__ == "__main__":
                                     transform=ContrastiveTransformations())
         total = len(unlabeled_data);
         data3 = torch.utils.data.random_split(unlabeled_data, [total//100, total-total//100])[0]
-        train_loader = data.DataLoader(data3, batch_size=BATCH_SIZE, shuffle=True,
+        train_loader = data.DataLoader(unlabeled_data, batch_size=BATCH_SIZE, shuffle=True,
                                         drop_last=True, pin_memory=True, num_workers=0)
         val_loader = data.DataLoader(train_data_contrast, batch_size=BATCH_SIZE, shuffle=False,
                                         drop_last=False, pin_memory=True, num_workers=0, )
         
-        model = SelfSupervisedModel();
+        online = SelfSupervisedModel(projection=CLSHead(768,256), predicition=MLP(256,256,4096));
+        target = SelfSupervisedModel(projection=CLSHead(768,256));
+        target.load_state_dict(online.state_dict(), strict=False);
+        
+        online = online.to(DEVICE);
+        target = target.to(DEVICE);
+
         summary_writer = SummaryWriter('exp\\self-imp');
         best_loss = 1e10;
-        optimizer = optim.AdamW(model.parameters(),
+        optimizer = optim.AdamW(online.parameters(),
                                 lr=LR)
 
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
@@ -350,22 +338,22 @@ if __name__ == "__main__":
                                                             eta_min=LR/50)
         best_model = None;
         for e in range(MAX_EPOCHS):
-            model.train();
-            train_loss = train(e, model, optimizer, train_loader);
-            # model.eval();
-            # if e%5 == 0:
-            #     save_samples(e, model, train_loader);
-            #loss, acc = valid(e, model, val_loader);
+            online.train();
+            target.train();
+            train_loss = train(e, online, target, optimizer, train_loader);
+            online.eval();
+            target.eval();
+            loss, rec_loss = valid(e, online, target, val_loader);
 
             summary_writer.add_scalar('Train/Loss', train_loss, e);
-            #summary_writer.add_scalar('Valid/Loss', loss, e);
+            summary_writer.add_scalar('Valid/Loss', loss, e);
             #summary_writer.add_scalar('Valid/Acc', acc, e);
 
-            # if loss < best_loss:
-            #     best_loss = loss;
-            #     best_model = model.state_dict();
-            #     pickle.dump(best_model, open('ckpt.pt', 'wb'))
-            # lr_scheduler.step();
+            if loss < best_loss:
+                best_loss = loss;
+                best_model = online.state_dict();
+                pickle.dump(best_model, open('ckpt.pt', 'wb'))
+            lr_scheduler.step();
     else:
 
         img_transforms = transforms.Compose([transforms.ToTensor(),
@@ -376,25 +364,25 @@ if __name__ == "__main__":
         test_img_data = STL10(root=DATASET_PATH, split='test', download=True,
                             transform=img_transforms)
 
-        model = torchvision.models.resnet18(num_classes=4*128)  # Output of last linear layer
-        # The MLP for g(.) consists of Linear->ReLU->Linear
-        model.fc = nn.Sequential(
-            model.fc,  # Linear(ResNet output, 4*hidden_dim)
-            nn.ReLU(inplace=True),
-            nn.Linear(4*HIDDEN_DIM, HIDDEN_DIM)
-        )
+        model = ViTS(3, 96,12,768,12,0.0,4,True, 10 );
+        state_dict = pickle.load(open('ckpt.pt', 'rb'));
+        state_dict_encoder = dict();
+        for s in state_dict:
+            if 'encoder' in s:
+                state_dict_encoder[s[8:]] = state_dict[s];
 
-        model.load_state_dict(pickle.load(open('ckpt.pt', 'rb')));
+
+        model.load_state_dict(state_dict_encoder, strict=False);
 
         train_lr_data = prepare_data_features(model, train_img_data);
         test_lr_data = prepare_data_features(model, test_img_data);
 
-        lr_data_loader_train = DataLoader(train_lr_data, batch_size=64, shuffle=True, num_workers=2, pin_memory=True, drop_last=False);
-        lr_data_loader_test = DataLoader(test_lr_data, batch_size=64, shuffle=True, num_workers=2, pin_memory=True, drop_last=False);
+        lr_data_loader_train = DataLoader(train_lr_data, batch_size=64, shuffle=True, num_workers=2, pin_memory=True, drop_last=True);
+        lr_data_loader_test = DataLoader(test_lr_data, batch_size=64, shuffle=True, num_workers=2, pin_memory=True, drop_last=True);
 
         d = get_smaller_dataset(train_lr_data, 5);
 
-        lr = LogisticRegression(512,10);
+        lr = LogisticRegression(768,10);
         for e in range(100):
             lr.train(e, lr_data_loader_train);
             lr.valid(e, lr_data_loader_test);

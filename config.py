@@ -7,7 +7,7 @@ LR = 1e-4;
 TEMPERATURE = 0.07;
 WEIGHT_DECAY = 1e-4;
 MAX_EPOCHS = 500;
-TRAIN_CONTRASTIVE = True;
+TRAIN_CONTRASTIVE = False;
 IMAGE_SIZE = 96
 
 # Path to the folder where the datasets are/should be downloaded (e.g. CIFAR10)
